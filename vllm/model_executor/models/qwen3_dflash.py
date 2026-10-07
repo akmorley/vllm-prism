@@ -23,6 +23,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    UnquantizedLinearMethod,
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
@@ -474,6 +475,22 @@ class DFlashQwen3Model(nn.Module):
     ) -> None:
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
+        # A quantized drafter (e.g. FP8 or GGUF) stores packed or repacked QKV
+        # weights that cannot be sliced and fed to F.linear. Its context K/V is
+        # projected per layer through each qkv_proj's own quant method instead.
+        self._context_qkv_layers: list[nn.Module] | None = None
+        if any(
+            not isinstance(a.qkv_proj.quant_method, UnquantizedLinearMethod)
+            for a in layers_attn
+        ):
+            self._context_qkv_layers = layers_attn
+            self._fused_kv_weight = None
+            self._fused_kv_bias = None
+            self._k_norm_weights = torch.stack(
+                [a.k_norm.weight.data for a in layers_attn], dim=0
+            ).contiguous()
+            return
+
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
         kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
@@ -548,9 +565,20 @@ class DFlashQwen3Model(nn.Module):
             self._hidden_norm_weight,
             self._rms_norm_eps,
         )
-        all_kv_flat = F.linear(
-            normed_context_states, self._fused_kv_weight, self._fused_kv_bias
-        )
+        if self._context_qkv_layers is None:
+            all_kv_flat = F.linear(
+                normed_context_states, self._fused_kv_weight, self._fused_kv_bias
+            )
+        else:
+            # Quantized drafter: per-layer QKV, keeping the K/V columns. The
+            # concatenation reproduces the fused layout [num_ctx, L * 2 * kv].
+            all_kv_flat = torch.cat(
+                [
+                    attn.qkv_proj(normed_context_states)[0][:, attn.q_size :]
+                    for attn in self._context_qkv_layers
+                ],
+                dim=1,
+            )
         # Single contiguous copy that separates K/V and transposes to
         # layer-major layout.  Result: [2, L, num_ctx, nkv, hd] contiguous.
         # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.
