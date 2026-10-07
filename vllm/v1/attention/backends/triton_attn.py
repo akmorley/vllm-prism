@@ -435,7 +435,6 @@ class TritonAttentionImpl(AttentionImpl):
             stride=(block_f32, slot_f32, head_f32),
             storage_offset=k_scale_off_f32,
         )
-        self._k_scale_cache.fill_(1.0)
 
         # V scales (second content half)
         self._v_scale_cache = torch.as_strided(
@@ -444,7 +443,10 @@ class TritonAttentionImpl(AttentionImpl):
             stride=(block_f32, slot_f32, head_f32),
             storage_offset=v_scale_off_f32,
         )
-        self._v_scale_cache.fill_(1.0)
+        # No initial fill: in hybrid models these views alias pages owned by
+        # mamba groups, and the first call happens mid-forward, after earlier
+        # mamba layers have written their state. Every scale read is either a
+        # slot written by reshape_and_cache or masked (other=1.0).
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
         return quant_key == kFp8StaticTensorSym
