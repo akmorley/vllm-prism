@@ -1556,6 +1556,7 @@ def _get_kv_cache_groups_uniform_page_size(
         # layers while accommodating speculative decoding drafters that add
         # extra layers to one attention type.
         group_size = max_num_layers
+    group_size = _avoid_full_attention_padding(group_size, layer_buckets, spec_buckets)
     grouped_layers = []
     for layers in layer_buckets:
         num_padding_layers = group_size - len(layers) % group_size
@@ -1580,6 +1581,41 @@ def _get_kv_cache_groups_uniform_page_size(
         for i in range(num_groups):
             grouped_layers.append(layers[i::num_groups])
     return create_kv_cache_group_specs(kv_cache_spec, grouped_layers)
+
+
+def _avoid_full_attention_padding(
+    group_size: int,
+    layer_buckets: list[list[str]],
+    spec_buckets: list[list[KVCacheSpec]],
+) -> int:
+    """Shrink `group_size` so that full-attention buckets need no padding layers.
+
+    A padding layer in a full-attention group costs memory for every token of
+    every request, while one in a sliding-window or mamba group costs a bounded
+    number of blocks per request. E.g. 16 full + 48 mamba + 5 sliding-window
+    drafter layers: the default group size 5 pads the full-attention layers to
+    20 (+25% KV per token); group size 4 pads only the drafter's 5 layers to 8.
+    The group count may at most double, to bound per-group bookkeeping.
+    """
+    full_counts = [
+        len(names)
+        for names, specs in zip(layer_buckets, spec_buckets)
+        if type(specs[0]) is FullAttentionSpec
+    ]
+    if all(count % group_size == 0 for count in full_counts):
+        return group_size
+    for candidate in range(group_size - 1, 0, -1):
+        if candidate * 2 < group_size:
+            break
+        if all(count % candidate == 0 for count in full_counts):
+            logger.info(
+                "Using KV cache group size %d instead of %d to avoid padding "
+                "full attention layers",
+                candidate,
+                group_size,
+            )
+            return candidate
+    return group_size
 
 
 def _get_per_layer_spec(

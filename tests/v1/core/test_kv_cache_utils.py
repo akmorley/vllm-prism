@@ -4414,3 +4414,52 @@ def test_trailing_layer_fallback_requires_exact_partition():
     _annotate_eagle_groups(config, specs, trimmed, use_trailing_layer_fallback=True)
 
     assert not any(g.is_eagle_group for g in trimmed)
+
+
+def _hybrid_spec(num_full: int, num_mamba: int, num_sw: int) -> dict[str, KVCacheSpec]:
+    """Layers with one shared page size (16 KiB), as after page unification."""
+    spec: dict[str, KVCacheSpec] = {}
+    spec.update({f"full.{i}": new_kv_cache_spec() for i in range(num_full)})
+    spec.update({f"mamba.{i}": new_mamba_spec() for i in range(num_mamba)})
+    spec.update(
+        {f"sw.{i}": new_sliding_window_spec(sliding_window=64) for i in range(num_sw)}
+    )
+    return spec
+
+
+def _group_sizes(groups, prefix: str) -> list[int]:
+    return [
+        len(g.layer_names) for g in groups if g.layer_names[0].startswith(prefix)
+    ]
+
+
+def test_group_size_avoids_full_attention_padding():
+    # Qwen3.5-like target (16 full + 48 GDN) with a 5-layer SWA drafter: the
+    # min-layer rule would pick 5 and pad the full-attention layers to 20.
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_page_size(
+        _hybrid_spec(16, 48, 5)
+    )
+    assert _group_sizes(groups, "full.") == [4, 4, 4, 4]
+    assert _group_sizes(groups, "mamba.") == [4] * 12
+    assert _group_sizes(groups, "sw.") == [3, 2]
+    assert sorted(n for g in groups for n in g.layer_names) == sorted(
+        _hybrid_spec(16, 48, 5)
+    )
+
+
+@pytest.mark.parametrize(
+    ("num_full", "num_sw", "full_sizes"),
+    [
+        # Already padding-free full attention: unchanged (Gemma3-like 1:5).
+        (10, 50, [10]),
+        # gpt-oss + eagle: 13 sw + 13 full via the max-layers rule.
+        (13, 12, [13]),
+        # No divisor of 13 within 2x the default group count: keep 5.
+        (13, 5, [5, 4, 4]),
+    ],
+)
+def test_group_size_unchanged_when_no_cheap_alternative(num_full, num_sw, full_sizes):
+    groups = kv_cache_utils._get_kv_cache_groups_uniform_page_size(
+        _hybrid_spec(num_full, 0, num_sw)
+    )
+    assert _group_sizes(groups, "full.") == full_sizes
