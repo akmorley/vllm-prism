@@ -68,4 +68,11 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
             del dflash_model.lm_head
         dflash_model.lm_head = target_lm_head
 
+    # The drafter builds embed_tokens / lm_head on the meta device and expects them to
+    # be either loaded from its checkpoint or shared from the target by now.
+    leftover = [n for n, p in dflash_model.named_parameters() if p.is_meta]
+    if leftover:
+        raise RuntimeError(
+            f"DFlash drafter parameters were neither loaded nor shared: {leftover[:4]}"
+        )
     return dflash_model

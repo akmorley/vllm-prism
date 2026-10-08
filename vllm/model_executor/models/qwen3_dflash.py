@@ -406,11 +406,17 @@ class DFlashQwen3Model(nn.Module):
 
         current_vllm_config = get_current_vllm_config()
 
-        self.embed_tokens = VocabParallelEmbedding(
-            self.config.vocab_size,
-            self.config.hidden_size,
-            prefix=maybe_prefix(prefix, "embed_tokens"),
-        )
+        # Built on the meta device: DFlash drafters normally share the target's
+        # embedding, and a vocabulary-sized BF16 table (2.5 GB for a 248K x 5120
+        # vocabulary) allocated only to be replaced can exhaust a 16 GB card while the
+        # target is already resident. load_weights materialises it if the checkpoint
+        # ships its own embedding.
+        with torch.device("meta"):
+            self.embed_tokens = VocabParallelEmbedding(
+                self.config.vocab_size,
+                self.config.hidden_size,
+                prefix=maybe_prefix(prefix, "embed_tokens"),
+            )
 
         # Masked query slots are fed to the draft as `mask_token_id`. Most DFlash
         # checkpoints will have the mask embedding in the vocabulary embedding table
@@ -749,11 +755,14 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         )
 
         logit_scale = getattr(self.config, "logit_scale", 1.0)
-        self.lm_head = ParallelLMHead(
-            self.config.draft_vocab_size,
-            self.config.hidden_size,
-            prefix=maybe_prefix(prefix, "lm_head"),
-        )
+        # Meta device for the same reason as embed_tokens: shared with the target
+        # unless the checkpoint ships its own head (materialised in load_weights).
+        with torch.device("meta"):
+            self.lm_head = ParallelLMHead(
+                self.config.draft_vocab_size,
+                self.config.hidden_size,
+                prefix=maybe_prefix(prefix, "lm_head"),
+            )
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size, scale=logit_scale
         )
@@ -868,6 +877,15 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         if mask_embedding is not None:
             model_weights["model.mask_embedding"] = mask_embedding
             self.model.has_separate_mask_embedding = True
+
+        # embed_tokens / lm_head were built on the meta device; give them real storage
+        # only when the checkpoint provides their weights (otherwise the loader shares
+        # the target's modules after loading).
+        device = next(p.device for p in self.model.layers.parameters() if not p.is_meta)
+        if includes_embed_tokens:
+            self.model.embed_tokens.to_empty(device=device)
+        if any("lm_head" in name for name in model_weights):
+            self.lm_head.to_empty(device=device)
 
         orig_to_new_substr = {}
         if not includes_draft_id_mapping:
