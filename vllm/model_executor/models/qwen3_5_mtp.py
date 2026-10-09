@@ -241,20 +241,45 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         self.model = Qwen3_5MultiTokenPredictor(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "mtp")
         )
+        self.target_vocab_size = config.vocab_size
+        self.draft_vocab_size = getattr(config, "draft_vocab_size", None)
+        if self.draft_vocab_size is None:
+            self.draft_vocab_size = self.target_vocab_size
+        if not 0 < self.draft_vocab_size <= self.target_vocab_size:
+            raise ValueError(
+                "Qwen3.5 MTP draft_vocab_size must be between 1 and the target "
+                f"vocabulary size ({self.target_vocab_size}), got "
+                f"{self.draft_vocab_size}."
+            )
 
         if get_pp_group().is_last_rank:
             self.lm_head = ParallelLMHead(
-                config.vocab_size,
+                self.draft_vocab_size,
                 config.hidden_size,
                 quant_config=self.quant_config,
                 prefix=maybe_prefix(prefix, "lm_head"),
             )
-            if config.tie_word_embeddings:
+            # A pruned draft head is independent from the full input embedding
+            # table, even when the target checkpoint ties its own embeddings.
+            if (
+                config.tie_word_embeddings
+                and self.draft_vocab_size == self.target_vocab_size
+            ):
                 self.lm_head = self.lm_head.tie_weights(self.model.embed_tokens)
         else:
             self.lm_head = PPMissingLayer()
 
-        self.logits_processor = LogitsProcessor(config.vocab_size)
+        self.logits_processor = LogitsProcessor(self.draft_vocab_size)
+        # The speculator replaces a draft lm_head with the target's unless the draft
+        # declares its own; a pruned head must be kept.
+        self.has_own_lm_head = self.draft_vocab_size < self.target_vocab_size
+        if self.draft_vocab_size < self.target_vocab_size:
+            self.draft_id_to_target_id = nn.Parameter(
+                torch.zeros(self.draft_vocab_size, dtype=torch.long),
+                requires_grad=False,
+            )
+        else:
+            self.draft_id_to_target_id = None
 
         self.make_empty_intermediate_tensors = (
             self.model.make_empty_intermediate_tensors
@@ -305,22 +330,50 @@ class Qwen3_5MTP(LocalArgmaxMixin, nn.Module, SupportsMultiModal, SupportsPP):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
-        return self.logits_processor(self.lm_head, hidden_states)
+        logits = self.logits_processor(self.lm_head, hidden_states)
+        if logits is None or self.draft_id_to_target_id is None:
+            return logits
+        # Scatter pruned-vocabulary logits into the target vocabulary (as EAGLE-3 does), so
+        # argmax and sampled drafting return target token ids. get_top_tokens (local argmax
+        # reduction) maps through d2t without materialising the full row.
+        targets = (
+            torch.arange(self.draft_vocab_size, device=logits.device)
+            + self.draft_id_to_target_id
+        )
+        full = logits.new_full((logits.shape[0], self.target_vocab_size), float("-inf"))
+        full[:, targets] = logits
+        return full
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        includes_draft_id_mapping = False
+        includes_lm_head = False
+
         def remap_weight_names(weights):
+            nonlocal includes_draft_id_mapping, includes_lm_head
             for name, weight in weights:
-                if name.startswith("mtp."):
+                if "d2t" in name:
+                    name = name.replace("d2t", "draft_id_to_target_id")
+                    includes_draft_id_mapping = True
+                elif name.startswith("mtp."):
                     name = name.replace("mtp.", "model.")
                 elif any(key in name for key in ["embed_tokens", "lm_head"]):
                     if "embed_tokens" in name:
                         name = name.replace("language_model.", "")
+                    if "lm_head" in name:
+                        includes_lm_head = True
                 else:
                     continue
                 yield name, weight
 
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(remap_weight_names(weights))
+        loaded = loader.load_weights(remap_weight_names(weights))
+        if self.draft_vocab_size < self.target_vocab_size:
+            if not includes_lm_head or not includes_draft_id_mapping:
+                raise ValueError(
+                    "Reduced-vocabulary Qwen3.5 MTP checkpoints must include "
+                    "both a pruned lm_head and a d2t mapping."
+                )
+        return loaded
 
 
 class Qwen3_5MoeMTP(Qwen3_5MTP, QwenNextMixtureOfExperts):
